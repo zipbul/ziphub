@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -20,6 +20,16 @@ interface SupervisedProcess {
 
 const INITIAL_BACKOFF = 500;
 const MAX_BACKOFF = 30_000;
+const BACKOFF_RESET_THRESHOLD_MS = 60_000;
+const MISSING_CWD_INTERVAL_MS = Number(process.env.ZIPHUB_SUPERVISOR_MISSING_CWD_INTERVAL_MS ?? 30_000);
+
+function cwdReady(path: string): boolean {
+  try {
+    return existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 function defaultConfigPath(): string {
   return process.env.ZIPHUB_AGENTS_CONFIG ?? join(homedir(), ".ziphub", "agents.json");
@@ -67,7 +77,24 @@ export function startSupervisor(options: {
   }));
 
   async function runOne(entry: SupervisedProcess): Promise<void> {
+    let loggedMissing = false;
     while (!entry.stopping) {
+      if (!cwdReady(entry.config.cwd)) {
+        if (!loggedMissing) {
+          console.error(
+            `[supervisor] agent ${entry.config.id} cwd missing or not a directory: ${entry.config.cwd}; pausing (recheck every ${MISSING_CWD_INTERVAL_MS}ms)`,
+          );
+          loggedMissing = true;
+        }
+        await new Promise((r) => setTimeout(r, MISSING_CWD_INTERVAL_MS));
+        continue;
+      }
+      if (loggedMissing) {
+        console.error(`[supervisor] agent ${entry.config.id} cwd reappeared; resuming`);
+        loggedMissing = false;
+        entry.backoffMs = INITIAL_BACKOFF;
+      }
+
       const env = {
         ...process.env,
         ZIPHUB_AGENT_CONFIG_JSON: JSON.stringify({
@@ -80,6 +107,7 @@ export function startSupervisor(options: {
           hub: options.hubUrl,
         }),
       };
+      const spawnedAt = Date.now();
       const proc = Bun.spawn(["bun", binPath], {
         cwd: entry.config.cwd,
         env,
@@ -89,9 +117,11 @@ export function startSupervisor(options: {
       entry.proc = proc;
       const code = await proc.exited;
       entry.proc = undefined;
+      const uptime = Date.now() - spawnedAt;
       if (entry.stopping) return;
+      if (uptime >= BACKOFF_RESET_THRESHOLD_MS) entry.backoffMs = INITIAL_BACKOFF;
       console.error(
-        `[supervisor] agent ${entry.config.id} exited code=${code}; restarting in ${entry.backoffMs}ms`,
+        `[supervisor] agent ${entry.config.id} exited code=${code} after ${uptime}ms; restarting in ${entry.backoffMs}ms`,
       );
       await new Promise((r) => setTimeout(r, entry.backoffMs));
       entry.backoffMs = Math.min(entry.backoffMs * 2, MAX_BACKOFF);
