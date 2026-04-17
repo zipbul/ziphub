@@ -9,6 +9,7 @@ import {
 } from "@zipbul/ziphub-agent-sdk/types";
 import { openDb } from "./db.ts";
 import { Bus } from "./bus.ts";
+import { startSupervisor } from "./supervisor.ts";
 
 const EVENT_RETENTION = Number(process.env.ZIPHUB_EVENT_RETENTION ?? 10000);
 const ADMIN_TOKEN = process.env.ZIPHUB_ADMIN_TOKEN ?? "";
@@ -449,3 +450,17 @@ const server = Bun.serve({
 });
 
 console.log(`🛰️  ziphub-server @ ${server.url}`);
+
+const supervisor = startSupervisor({ hubUrl: server.url.toString().replace(/\/$/, "") });
+if (supervisor.size() > 0) {
+  console.log(`🧑‍✈️  supervising ${supervisor.size()} agent(s) from ${supervisor.configPath}`);
+}
+
+const shutdown = async (sig: string) => {
+  console.log(`\n[hub] ${sig}, shutting down supervisor`);
+  await supervisor.stop();
+  server.stop(true);
+  process.exit(0);
+};
+process.on("SIGINT", () => { void shutdown("SIGINT"); });
+process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
