@@ -123,24 +123,46 @@ async function sha256Hex12(s: string): Promise<string> {
   return hex;
 }
 
+function truncStr(s: string, max: number): string {
+  return s.length > max ? s.slice(0, Math.floor(max)) + "…[truncated]" : s;
+}
+
 function truncatePayload(
   payload: Record<string, unknown>,
   maxBytes: number,
 ): { payload: Record<string, unknown>; truncated: boolean } {
-  if (JSON.stringify(payload).length <= maxBytes) return { payload, truncated: false };
+  const originalSize = JSON.stringify(payload).length;
+  if (originalSize <= maxBytes) return { payload, truncated: false };
+
   const out: Record<string, unknown> = { ...payload };
-  if (typeof out.tool_response === "string" && (out.tool_response as string).length > maxBytes / 2) {
-    out.tool_response = (out.tool_response as string).slice(0, Math.floor(maxBytes / 2)) + "…[truncated]";
+  if (typeof out.tool_response === "string") {
+    out.tool_response = truncStr(out.tool_response as string, maxBytes / 2);
   }
   if (out.tool_input && typeof out.tool_input === "object") {
     const ti: Record<string, unknown> = { ...(out.tool_input as Record<string, unknown>) };
     for (const k of Object.keys(ti)) {
       const v = ti[k];
-      if (typeof v === "string" && v.length > maxBytes / 4) {
-        ti[k] = v.slice(0, Math.floor(maxBytes / 4)) + "…[truncated]";
-      }
+      if (typeof v === "string") ti[k] = truncStr(v, maxBytes / 4);
     }
     out.tool_input = ti;
+  }
+  if (typeof out.prompt === "string") {
+    out.prompt = truncStr(out.prompt as string, maxBytes / 2);
+  }
+  if (typeof out.message === "string") {
+    out.message = truncStr(out.message as string, maxBytes / 2);
+  }
+
+  if (JSON.stringify(out).length > maxBytes) {
+    return {
+      payload: {
+        omitted: "too_large",
+        originalSize,
+        hook_event_name: out.hook_event_name,
+        tool_name: out.tool_name,
+      },
+      truncated: true,
+    };
   }
   return { payload: out, truncated: true };
 }
