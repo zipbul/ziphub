@@ -42,6 +42,7 @@ export interface RegisterResponse {
 export type HubEvent =
   | { type: "task.assigned"; task: Task }
   | { type: "task.canceled"; taskId: string }
+  | { type: "agent.removed"; reason: "deregistered" }
   | {
       type: "peer.message";
       from: string;
@@ -54,6 +55,8 @@ export type HubEvent =
       messageId: string;
       reason: "offline" | "unknown";
     };
+
+export const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export type AgentEvent =
   | {
