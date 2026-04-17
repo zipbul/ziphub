@@ -35,12 +35,38 @@ export interface AgentCard {
   version?: string;
 }
 
+export interface RegisterResponse {
+  token: string;
+}
+
 export type HubEvent =
   | { type: "task.assigned"; task: Task }
   | { type: "task.canceled"; taskId: string }
-  | { type: "peer.message"; from: string; messageId: string; parts: Part[] };
+  | {
+      type: "peer.message";
+      from: string;
+      messageId: string;
+      parts: Part[];
+    }
+  | {
+      type: "peer.undeliverable";
+      to: string;
+      messageId: string;
+      reason: "offline" | "unknown";
+    };
 
 export type AgentEvent =
-  | { type: "task.update"; taskId: string; state: TaskState; output?: Message; error?: string }
-  | { type: "log"; level: "info" | "warn" | "error"; message: string; data?: unknown }
-  | { type: "peer.send"; to: string; parts: Part[] };
+  | {
+      type: "task.update";
+      taskId: string;
+      state: TaskState;
+      output?: Message;
+      error?: string;
+    }
+  | {
+      type: "log";
+      level: "info" | "warn" | "error";
+      message: string;
+      data?: unknown;
+    }
+  | { type: "peer.send"; to: string; messageId?: string; parts: Part[] };

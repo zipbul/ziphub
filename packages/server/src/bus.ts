@@ -1,31 +1,37 @@
 import type { HubEvent } from "@zipbul/ziphub-agent-sdk/types";
 
-type Subscriber = (event: HubEvent) => void;
+export interface Subscriber {
+  send: (event: HubEvent) => void;
+  close: () => void;
+}
 
 export class Bus {
-  private subs = new Map<string, Set<Subscriber>>();
+  private subs = new Map<string, Subscriber>();
 
-  subscribe(agentId: string, fn: Subscriber): () => void {
-    let set = this.subs.get(agentId);
-    if (!set) {
-      set = new Set();
-      this.subs.set(agentId, set);
+  subscribe(agentId: string, sub: Subscriber): () => void {
+    const existing = this.subs.get(agentId);
+    if (existing && existing !== sub) {
+      try { existing.close(); } catch { /* ignore */ }
     }
-    set.add(fn);
+    this.subs.set(agentId, sub);
     return () => {
-      set!.delete(fn);
-      if (set!.size === 0) this.subs.delete(agentId);
+      if (this.subs.get(agentId) === sub) this.subs.delete(agentId);
     };
   }
 
   publish(agentId: string, event: HubEvent): boolean {
-    const set = this.subs.get(agentId);
-    if (!set || set.size === 0) return false;
-    for (const fn of set) fn(event);
-    return true;
+    const sub = this.subs.get(agentId);
+    if (!sub) return false;
+    try {
+      sub.send(event);
+      return true;
+    } catch {
+      this.subs.delete(agentId);
+      return false;
+    }
   }
 
   isConnected(agentId: string): boolean {
-    return (this.subs.get(agentId)?.size ?? 0) > 0;
+    return this.subs.has(agentId);
   }
 }
