@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "main": "src/index.ts",
+  "bin": {
+    "ziphub-agent": "./bin/agent.ts"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./types": "./src/types.ts",
