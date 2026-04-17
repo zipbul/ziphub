@@ -343,7 +343,9 @@ const server = Bun.serve({
             `SELECT created_at, payload FROM events
              WHERE kind = 'task.step'
                AND json_extract(payload, '$.taskId') = ?
-             ORDER BY id DESC LIMIT 20`,
+             ORDER BY COALESCE(json_extract(payload, '$.step.at'), created_at) DESC,
+                      id DESC
+             LIMIT 20`,
           )
           .all(id) as { created_at: string; payload: string }[];
 
@@ -362,8 +364,9 @@ const server = Bun.serve({
 
         const counts = new Map<string, number>();
         for (const s of recentSteps.slice(0, 10)) {
+          const kind = (s as any).kind as string | undefined;
           const h = (s as any).argsHash as string | undefined;
-          if (!h) continue;
+          if (kind !== "PreToolUse" || !h) continue;
           counts.set(h, (counts.get(h) ?? 0) + 1);
         }
         const loopScore = counts.size === 0 ? 0 : Math.max(...counts.values());
