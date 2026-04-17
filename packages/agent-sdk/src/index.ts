@@ -1,14 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import type {
-  AgentCard,
-  AgentEvent,
-  HubEvent,
-  Message,
-  Part,
-  RegisterResponse,
-  Task,
+import {
+  AGENT_ID_PATTERN,
+  type AgentCard,
+  type AgentEvent,
+  type HubEvent,
+  type Message,
+  type Part,
+  type RegisterResponse,
+  type Task,
 } from "./types.ts";
 
 export * from "./types.ts";
@@ -72,7 +73,12 @@ function toMessage(result: Message | Part[] | string | void): Message | undefine
   return result;
 }
 
+export type StopReason = "deregistered" | "stale-token" | "error";
+
 export function createAgent(options: AgentOptions) {
+  if (!AGENT_ID_PATTERN.test(options.id)) {
+    throw new Error(`invalid agent id ${JSON.stringify(options.id)}; must match ${AGENT_ID_PATTERN}`);
+  }
   const hub = (options.hub ?? "http://127.0.0.1:3000").replace(/\/$/, "");
   const card: AgentCard = {
     id: options.id,
@@ -86,6 +92,7 @@ export function createAgent(options: AgentOptions) {
   let taskHandler: TaskHandler | undefined;
   let peerHandler: PeerHandler | undefined;
   let undeliverableHandler: UndeliverableHandler | undefined;
+  let stopHandler: ((reason: StopReason, detail?: string) => void | Promise<void>) | undefined;
   let stopped = false;
   let controller: AbortController | undefined;
   const inflight = new Map<string, AbortController>();
@@ -153,10 +160,18 @@ export function createAgent(options: AgentOptions) {
       await peerHandler?.(event.from, event.parts, event.messageId);
     } else if (event.type === "peer.undeliverable") {
       await undeliverableHandler?.(event);
+    } else if (event.type === "agent.removed") {
+      stopped = true;
+      controller?.abort();
+      for (const ac of inflight.values()) ac.abort();
+      inflight.clear();
+      try { if (existsSync(tokenPath)) rmSync(tokenPath); } catch { /* ignore */ }
+      await stopHandler?.("deregistered");
     }
   }
 
-  async function register(): Promise<void> {
+  async function register(options: { fresh?: boolean } = {}): Promise<void> {
+    if (options.fresh) token = undefined;
     const res = await fetch(`${hub}/register`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeader() },
@@ -166,18 +181,19 @@ export function createAgent(options: AgentOptions) {
       throw new Error(
         `register ${res.status}: ${await res.text()}` +
           (res.status === 401 || res.status === 403
-            ? ` (token missing or mismatch; delete ${tokenPath} and agent row to reset)`
+            ? ` (token mismatch; delete ${tokenPath} and the agent row on hub to reset)`
             : ""),
       );
     }
     const body = (await res.json()) as RegisterResponse;
-    if (!token && body.token) {
+    if (body.token && body.token !== token) {
       saveToken(tokenPath, body.token);
       token = body.token;
     }
   }
 
   async function connectStream(): Promise<void> {
+    let reregistered = false;
     while (!stopped) {
       controller = new AbortController();
       try {
@@ -185,7 +201,28 @@ export function createAgent(options: AgentOptions) {
           headers: { accept: "text/event-stream", ...authHeader() },
           signal: controller.signal,
         });
+        if (res.status === 404) {
+          stopped = true;
+          try { if (existsSync(tokenPath)) rmSync(tokenPath); } catch { /* ignore */ }
+          await stopHandler?.("deregistered");
+          return;
+        }
+        if ((res.status === 401 || res.status === 403) && !reregistered) {
+          reregistered = true;
+          try {
+            await register({ fresh: true });
+            continue;
+          } catch (err) {
+            stopped = true;
+            await stopHandler?.(
+              "stale-token",
+              err instanceof Error ? err.message : String(err),
+            );
+            return;
+          }
+        }
         if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
+        reregistered = false;
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -227,6 +264,9 @@ export function createAgent(options: AgentOptions) {
     },
     onPeerUndeliverable(handler: UndeliverableHandler) {
       undeliverableHandler = handler;
+    },
+    onStop(handler: (reason: StopReason, detail?: string) => void | Promise<void>) {
+      stopHandler = handler;
     },
     async emit(event: AgentEvent) {
       await sendAgentEvent(event);

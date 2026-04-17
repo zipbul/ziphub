@@ -34,4 +34,14 @@ export class Bus {
   isConnected(agentId: string): boolean {
     return this.subs.has(agentId);
   }
+
+  kick(agentId: string, finalEvent?: HubEvent): void {
+    const sub = this.subs.get(agentId);
+    if (!sub) return;
+    if (finalEvent) {
+      try { sub.send(finalEvent); } catch { /* ignore */ }
+    }
+    try { sub.close(); } catch { /* ignore */ }
+    this.subs.delete(agentId);
+  }
 }

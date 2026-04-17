@@ -1,15 +1,17 @@
-import type {
-  AgentCard,
-  AgentEvent,
-  HubEvent,
-  Message,
-  Task,
-  TaskState,
+import {
+  AGENT_ID_PATTERN,
+  type AgentCard,
+  type AgentEvent,
+  type HubEvent,
+  type Message,
+  type Task,
+  type TaskState,
 } from "@zipbul/ziphub-agent-sdk/types";
 import { openDb } from "./db.ts";
 import { Bus } from "./bus.ts";
 
 const EVENT_RETENTION = Number(process.env.ZIPHUB_EVENT_RETENTION ?? 10000);
+const ADMIN_TOKEN = process.env.ZIPHUB_ADMIN_TOKEN ?? "";
 
 const db = openDb();
 const bus = new Bus();
@@ -44,6 +46,12 @@ async function requireAgent(req: Request, agentId: string): Promise<Response | n
   if (!row) return new Response("unknown agent", { status: 404 });
   const hash = await hashToken(token);
   if (hash !== row.token_hash) return new Response("forbidden", { status: 403 });
+  return null;
+}
+
+function requireAdmin(req: Request): Response | null {
+  if (!ADMIN_TOKEN) return null;
+  if (bearer(req) !== ADMIN_TOKEN) return new Response("admin required", { status: 401 });
   return null;
 }
 
@@ -189,6 +197,8 @@ const server = Bun.serve({
       async POST(req) {
         const card = (await req.json()) as AgentCard;
         if (!card?.id) return new Response("bad request", { status: 400 });
+        if (!AGENT_ID_PATTERN.test(card.id))
+          return new Response("invalid agent id", { status: 400 });
         const ts = now();
         const existing = db.query("SELECT token_hash FROM agents WHERE id = ?").get(card.id) as
           | { token_hash: string }
@@ -301,6 +311,8 @@ const server = Bun.serve({
 
     "/api/tasks": {
       async POST(req) {
+        const adminErr = requireAdmin(req);
+        if (adminErr) return adminErr;
         const body = (await req.json()) as {
           agentId: string;
           fromAgentId?: string;
@@ -319,6 +331,8 @@ const server = Bun.serve({
 
     "/api/tasks/:id/cancel": {
       POST(req) {
+        const adminErr = requireAdmin(req);
+        if (adminErr) return adminErr;
         const task = cancelTask(req.params.id);
         if (!task) return new Response("unknown task", { status: 404 });
         return Response.json(task);
@@ -345,16 +359,19 @@ const server = Bun.serve({
     "/api/agents/:id": {
       async DELETE(req) {
         const agentId = req.params.id;
-        const authErr = await requireAgent(req, agentId);
-        if (authErr) return authErr;
+        const adminOk = ADMIN_TOKEN && bearer(req) === ADMIN_TOKEN;
+        if (!adminOk) {
+          const authErr = await requireAgent(req, agentId);
+          if (authErr) return authErr;
+        } else {
+          const exists = db.query("SELECT 1 FROM agents WHERE id = ?").get(agentId);
+          if (!exists) return new Response("unknown agent", { status: 404 });
+        }
         const inflight = db
           .query("SELECT id FROM tasks WHERE agent_id = ? AND state IN ('submitted','working')")
           .all(agentId) as { id: string }[];
         for (const row of inflight) cancelTask(row.id);
-        const existing = bus.isConnected(agentId);
-        if (existing) {
-          bus.publish(agentId, { type: "task.canceled", taskId: "__deregister__" });
-        }
+        bus.kick(agentId, { type: "agent.removed", reason: "deregistered" });
         db.query("DELETE FROM agents WHERE id = ?").run(agentId);
         logEvent(agentId, "agent.deregistered", { canceledTaskCount: inflight.length });
         return Response.json({ ok: true, canceledTaskCount: inflight.length });
