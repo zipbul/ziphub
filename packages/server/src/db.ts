@@ -10,6 +10,7 @@ export function openDb(path = process.env.ZIPHUB_DB ?? "ziphub.db"): Database {
       name          TEXT,
       capabilities  TEXT NOT NULL DEFAULT '[]',
       version       TEXT,
+      token_hash    TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen_at  TEXT NOT NULL
     );
