@@ -58,6 +58,15 @@ export type HubEvent =
 
 export const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
+export interface TaskStep {
+  kind: string;
+  toolName?: string;
+  argsHash?: string;
+  payload: Record<string, unknown>;
+  truncated?: boolean;
+  at: string;
+}
+
 export type AgentEvent =
   | {
       type: "task.update";
@@ -66,6 +75,7 @@ export type AgentEvent =
       output?: Message;
       error?: string;
     }
+  | { type: "task.step"; taskId: string; step: TaskStep }
   | {
       type: "log";
       level: "info" | "warn" | "error";

@@ -161,6 +161,8 @@ function handleAgentEvent(agentId: string, event: AgentEvent): void {
       event.taskId,
       agentId,
     );
+  } else if (event.type === "task.step") {
+    // step events are already logged via logEvent above; no additional action
   } else if (event.type === "peer.send") {
     const targetExists = db.query("SELECT 1 FROM agents WHERE id = ?").get(event.to);
     const messageId = event.messageId ?? crypto.randomUUID();
@@ -326,6 +328,54 @@ const server = Bun.serve({
       GET() {
         const rows = db.query("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 200").all() as any[];
         return Response.json(rows.map(rowToTask));
+      },
+    },
+
+    "/api/tasks/:id": {
+      GET(req) {
+        const id = req.params.id;
+        const row = db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any;
+        if (!row) return new Response("unknown task", { status: 404 });
+        const task = rowToTask(row);
+
+        const stepRows = db
+          .query(
+            `SELECT created_at, payload FROM events
+             WHERE kind = 'task.step'
+               AND json_extract(payload, '$.taskId') = ?
+             ORDER BY id DESC LIMIT 20`,
+          )
+          .all(id) as { created_at: string; payload: string }[];
+
+        const recentSteps = stepRows.map((r) => {
+          const parsed = JSON.parse(r.payload) as { step?: Record<string, unknown> };
+          return { ...(parsed.step ?? {}), at: (parsed.step as any)?.at ?? r.created_at };
+        });
+
+        const { n: stepCount } = db
+          .query(
+            `SELECT COUNT(*) as n FROM events
+             WHERE kind = 'task.step'
+               AND json_extract(payload, '$.taskId') = ?`,
+          )
+          .get(id) as { n: number };
+
+        const counts = new Map<string, number>();
+        for (const s of recentSteps.slice(0, 10)) {
+          const h = (s as any).argsHash as string | undefined;
+          if (!h) continue;
+          counts.set(h, (counts.get(h) ?? 0) + 1);
+        }
+        const loopScore = counts.size === 0 ? 0 : Math.max(...counts.values());
+
+        return Response.json({
+          ...task,
+          lastStepAt: recentSteps[0]?.at ?? null,
+          stepCount,
+          loopScore,
+          connected: bus.isConnected(task.agentId),
+          recentSteps,
+        });
       },
     },
 

@@ -6,7 +6,11 @@
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./types": "./src/types.ts"
+    "./types": "./src/types.ts",
+    "./bibe": "./src/bibe.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.112"
   },
   "devDependencies": {
     "@types/bun": "latest"
