@@ -2,32 +2,28 @@ import {
   AGENT_ID_PATTERN,
   type AgentCard,
   type AgentEvent,
-  type HubEvent,
   type Message,
   type Task,
-  type TaskState,
 } from "@zipbul/ziphub-agent-sdk/types";
-import { openDb } from "./db.ts";
-import { Bus } from "./bus.ts";
+import type {
+  AgentCard as A2AAgentCard,
+  Message as A2AMessage,
+  Task as A2ATask,
+} from "@a2a-js/sdk";
+import { Storage, type AgentRow, type TaskRow } from "./storage.ts";
 import { startSupervisor } from "./supervisor.ts";
 
-const EVENT_RETENTION = Number(process.env.ZIPHUB_EVENT_RETENTION ?? 10000);
+const PEER_CALL_TIMEOUT_MS = Number(process.env.ZIPHUB_PEER_CALL_TIMEOUT_MS ?? 60_000);
+type PeerWaiter = { resolve: (row: TaskRow) => void; reject: (err: Error) => void };
+const peerCallWaiters = new Map<string, PeerWaiter>();
+
 const ADMIN_TOKEN = process.env.ZIPHUB_ADMIN_TOKEN ?? "";
 
-const db = openDb();
-const bus = new Bus();
+const storage = new Storage();
+await storage.init();
 
 function now(): string {
   return new Date().toISOString();
-}
-
-function newToken(): string {
-  return crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
-}
-
-async function hashToken(token: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-  return Buffer.from(buf).toString("hex");
 }
 
 function bearer(req: Request): string | null {
@@ -38,92 +34,82 @@ function bearer(req: Request): string | null {
   return token;
 }
 
-async function requireAgent(req: Request, agentId: string): Promise<Response | null> {
-  const token = bearer(req);
-  if (!token) return new Response("unauthorized", { status: 401 });
-  const row = db.query("SELECT token_hash FROM agents WHERE id = ?").get(agentId) as
-    | { token_hash: string }
-    | undefined;
-  if (!row) return new Response("unknown agent", { status: 404 });
-  const hash = await hashToken(token);
-  if (hash !== row.token_hash) return new Response("forbidden", { status: 403 });
-  return null;
-}
-
 function requireAdmin(req: Request): Response | null {
   if (!ADMIN_TOKEN) return null;
   if (bearer(req) !== ADMIN_TOKEN) return new Response("admin required", { status: 401 });
   return null;
 }
 
-function rowToTask(row: any): Task {
+function rowToTask(row: TaskRow): Task {
   return {
     id: row.id,
-    agentId: row.agent_id,
-    fromAgentId: row.from_agent_id ?? undefined,
-    state: row.state as TaskState,
-    input: JSON.parse(row.input) as Message,
-    output: row.output ? (JSON.parse(row.output) as Message) : undefined,
-    error: row.error ?? undefined,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    agentId: row.agentId,
+    fromAgentId: row.fromAgentId,
+    state: row.state,
+    input: row.input as Message,
+    output: row.output as Message | undefined,
+    error: row.error,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
-function logEvent(agentId: string | null, kind: string, payload: unknown): void {
-  db.query("INSERT INTO events (agent_id, kind, payload, created_at) VALUES (?, ?, ?, ?)").run(
-    agentId,
-    kind,
-    JSON.stringify(payload),
-    now(),
-  );
-  if (EVENT_RETENTION > 0) {
-    db.query(
-      `DELETE FROM events WHERE id IN (
-         SELECT id FROM events ORDER BY id DESC LIMIT -1 OFFSET ?
-       )`,
-    ).run(EVENT_RETENTION);
+async function logEvent(agentId: string | null, kind: string, payload: unknown): Promise<void> {
+  await storage.appendEvent(agentId, kind, payload, now());
+}
+
+async function postToAgent(
+  agent: AgentRow,
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${agent.endpoint}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    return res.ok || res.status === 202;
+  } catch {
+    return false;
   }
 }
 
-function dispatchTask(task: Task): void {
-  const delivered = bus.publish(task.agentId, { type: "task.assigned", task });
-  if (delivered && task.state === "submitted") {
-    db.query("UPDATE tasks SET state = 'working', updated_at = ? WHERE id = ?").run(now(), task.id);
+async function dispatchTask(task: Task): Promise<void> {
+  const agent = await storage.getAgent(task.agentId);
+  if (!agent) return;
+  const ok = await postToAgent(agent, "/task", task);
+  if (ok && task.state === "submitted") {
+    const row = await storage.getTask(task.id);
+    if (row) {
+      row.state = "working";
+      row.updatedAt = now();
+      await storage.upsertTask(row);
+    }
+  } else if (!ok) {
+    await logEvent(task.agentId, "task.dispatch.failed", { taskId: task.id, endpoint: agent.endpoint });
   }
 }
 
-function recoverWorkingTasks(agentId: string): void {
-  const changed = db
-    .query(
-      "UPDATE tasks SET state = 'submitted', updated_at = ? WHERE agent_id = ? AND state = 'working' RETURNING id",
-    )
-    .all(now(), agentId) as { id: string }[];
-  if (changed.length > 0) {
-    logEvent(agentId, "task.recovered", { taskIds: changed.map((r) => r.id) });
+async function recoverPending(agentId: string): Promise<void> {
+  const recovered = await storage.recoverWorkingToSubmitted(agentId, now());
+  if (recovered.length > 0) await logEvent(agentId, "task.recovered", { taskIds: recovered });
+  for (const row of await storage.pendingTasksForAgent(agentId)) {
+    await dispatchTask(rowToTask(row));
   }
 }
 
-function flushPending(agentId: string): void {
-  const rows = db
-    .query("SELECT * FROM tasks WHERE agent_id = ? AND state = 'submitted' ORDER BY created_at")
-    .all(agentId) as any[];
-  for (const row of rows) dispatchTask(rowToTask(row));
-}
-
-function createTask(input: {
+async function createTask(input: {
   agentId: string;
   fromAgentId?: string;
   message: Message;
-}): Task | null {
-  const agentExists = db.query("SELECT 1 FROM agents WHERE id = ?").get(input.agentId);
-  if (!agentExists) return null;
+}): Promise<Task | null> {
+  if (!(await storage.getAgent(input.agentId))) return null;
   const id = crypto.randomUUID();
   const ts = now();
-  db.query(
-    "INSERT INTO tasks (id, agent_id, from_agent_id, state, input, created_at, updated_at) VALUES (?, ?, ?, 'submitted', ?, ?, ?)",
-  ).run(id, input.agentId, input.fromAgentId ?? null, JSON.stringify(input.message), ts, ts);
-  const task: Task = {
+  const row: TaskRow = {
     id,
     agentId: input.agentId,
     fromAgentId: input.fromAgentId,
@@ -132,57 +118,140 @@ function createTask(input: {
     createdAt: ts,
     updatedAt: ts,
   };
-  logEvent(input.agentId, "task.created", { taskId: id, fromAgentId: input.fromAgentId ?? null });
-  dispatchTask(task);
+  await storage.upsertTask(row);
+  const task = rowToTask(row);
+  await logEvent(input.agentId, "task.created", { taskId: id, fromAgentId: input.fromAgentId ?? null });
+  await dispatchTask(task);
   return task;
 }
 
-function cancelTask(taskId: string): Task | null {
-  const row = db.query("SELECT * FROM tasks WHERE id = ?").get(taskId) as any;
+async function cancelTask(taskId: string): Promise<Task | null> {
+  const row = await storage.getTask(taskId);
   if (!row) return null;
   const terminal = row.state === "completed" || row.state === "failed" || row.state === "canceled";
   if (terminal) return rowToTask(row);
-  db.query("UPDATE tasks SET state = 'canceled', updated_at = ? WHERE id = ?").run(now(), taskId);
-  bus.publish(row.agent_id, { type: "task.canceled", taskId });
-  logEvent(row.agent_id, "task.canceled", { taskId });
-  return rowToTask({ ...row, state: "canceled", updated_at: now() });
+  row.state = "canceled";
+  row.updatedAt = now();
+  await storage.upsertTask(row);
+  const agent = await storage.getAgent(row.agentId);
+  if (agent) await postToAgent(agent, "/cancel", { taskId });
+  await logEvent(row.agentId, "task.canceled", { taskId });
+  return rowToTask(row);
 }
 
-function handleAgentEvent(agentId: string, event: AgentEvent): void {
-  logEvent(agentId, event.type, event);
+async function handleAgentEvent(agentId: string, event: AgentEvent): Promise<void> {
+  await logEvent(agentId, event.type, event);
 
   if (event.type === "task.update") {
-    db.query(
-      "UPDATE tasks SET state = ?, output = ?, error = ?, updated_at = ? WHERE id = ? AND agent_id = ?",
-    ).run(
-      event.state,
-      event.output ? JSON.stringify(event.output) : null,
-      event.error ?? null,
-      now(),
-      event.taskId,
-      agentId,
-    );
-  } else if (event.type === "task.step") {
-    // step events are already logged via logEvent above; no additional action
-  } else if (event.type === "peer.send") {
-    const targetExists = db.query("SELECT 1 FROM agents WHERE id = ?").get(event.to);
-    const messageId = event.messageId ?? crypto.randomUUID();
-    if (!targetExists) {
-      bus.publish(agentId, { type: "peer.undeliverable", to: event.to, messageId, reason: "unknown" });
-      logEvent(agentId, "peer.undeliverable", { to: event.to, messageId, reason: "unknown" });
-      return;
-    }
-    const delivered = bus.publish(event.to, {
-      type: "peer.message",
-      from: agentId,
-      messageId,
-      parts: event.parts,
-    });
-    if (!delivered) {
-      bus.publish(agentId, { type: "peer.undeliverable", to: event.to, messageId, reason: "offline" });
-      logEvent(agentId, "peer.undeliverable", { to: event.to, messageId, reason: "offline" });
+    const row = await storage.getTask(event.taskId);
+    if (row && row.agentId === agentId) {
+      row.state = event.state;
+      row.output = event.output;
+      row.error = event.error;
+      row.updatedAt = now();
+      await storage.upsertTask(row);
+
+      const isTerminal =
+        event.state === "completed" || event.state === "failed" || event.state === "canceled";
+      if (isTerminal) {
+        const waiter = peerCallWaiters.get(event.taskId);
+        if (waiter) {
+          peerCallWaiters.delete(event.taskId);
+          waiter.resolve(row);
+        }
+      }
     }
   }
+  // task.step / log: events 테이블에 기록만, 별도 처리 없음
+}
+
+function buildA2AAgentCard(agent: AgentRow, hubUrl: string): A2AAgentCard {
+  const skills = (agent.capabilities ?? []).map((cap) => ({
+    id: cap,
+    name: cap,
+    description: cap,
+    tags: [cap],
+  }));
+  return {
+    name: agent.name ?? agent.id,
+    description: `ziphub agent ${agent.id}`,
+    protocolVersion: "0.3.0",
+    version: agent.version ?? "0.0.0",
+    url: `${hubUrl}/a2a/${agent.id}/`,
+    skills,
+    capabilities: { pushNotifications: false, streaming: false },
+    defaultInputModes: ["text"],
+    defaultOutputModes: ["text"],
+  };
+}
+
+function taskRowToA2ATask(row: TaskRow): A2ATask {
+  const history: A2AMessage[] = [];
+  if (row.input) history.push(row.input as A2AMessage);
+  if (row.output) history.push(row.output as A2AMessage);
+  return {
+    kind: "task",
+    id: row.id,
+    contextId: row.id,
+    status: {
+      state: row.state,
+      message: row.output as A2AMessage | undefined,
+    },
+    history,
+  };
+}
+
+function jsonRpcError(id: unknown, code: number, message: string): Response {
+  return Response.json({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+}
+
+function jsonRpcResult(id: unknown, result: unknown): Response {
+  return Response.json({ jsonrpc: "2.0", id: id ?? null, result });
+}
+
+async function createPeerTask(
+  toAgentId: string,
+  fromAgentId: string | undefined,
+  message: A2AMessage,
+): Promise<TaskRow | null> {
+  if (!(await storage.getAgent(toAgentId))) return null;
+  const id = crypto.randomUUID();
+  const ts = now();
+  const row: TaskRow = {
+    id,
+    agentId: toAgentId,
+    fromAgentId,
+    state: "submitted",
+    input: message,
+    createdAt: ts,
+    updatedAt: ts,
+  };
+  await storage.upsertTask(row);
+  await logEvent(toAgentId, "task.created", {
+    taskId: id,
+    fromAgentId: fromAgentId ?? null,
+    source: "peer",
+  });
+  return row;
+}
+
+function waitForCompletion(taskId: string, timeoutMs: number): Promise<TaskRow> {
+  return new Promise((resolve, reject) => {
+    const tm = setTimeout(() => {
+      peerCallWaiters.delete(taskId);
+      reject(new Error("peer call timeout"));
+    }, timeoutMs);
+    peerCallWaiters.set(taskId, {
+      resolve: (row) => {
+        clearTimeout(tm);
+        resolve(row);
+      },
+      reject: (err) => {
+        clearTimeout(tm);
+        reject(err);
+      },
+    });
+  });
 }
 
 const server = Bun.serve({
@@ -202,45 +271,25 @@ const server = Bun.serve({
         if (!card?.id) return new Response("bad request", { status: 400 });
         if (!AGENT_ID_PATTERN.test(card.id))
           return new Response("invalid agent id", { status: 400 });
+        if (!card.endpoint || !/^https?:\/\//.test(card.endpoint))
+          return new Response("endpoint required", { status: 400 });
+
         const ts = now();
-        const existing = db.query("SELECT token_hash FROM agents WHERE id = ?").get(card.id) as
-          | { token_hash: string }
-          | undefined;
+        const existing = await storage.getAgent(card.id);
+        const row: AgentRow = {
+          id: card.id,
+          name: card.name,
+          capabilities: card.capabilities ?? [],
+          version: card.version,
+          endpoint: card.endpoint,
+          registeredAt: existing?.registeredAt ?? ts,
+          lastSeenAt: ts,
+        };
+        await storage.upsertAgent(row);
+        await logEvent(card.id, existing ? "agent.reregistered" : "agent.registered", card);
 
-        if (existing) {
-          const presented = bearer(req);
-          if (!presented) return new Response("unauthorized", { status: 401 });
-          if ((await hashToken(presented)) !== existing.token_hash)
-            return new Response("forbidden", { status: 403 });
-          db.query(
-            "UPDATE agents SET name = ?, capabilities = ?, version = ?, last_seen_at = ? WHERE id = ?",
-          ).run(
-            card.name ?? null,
-            JSON.stringify(card.capabilities ?? []),
-            card.version ?? null,
-            ts,
-            card.id,
-          );
-          logEvent(card.id, "agent.reregistered", card);
-          return Response.json({ token: presented });
-        }
-
-        const token = newToken();
-        const hash = await hashToken(token);
-        db.query(
-          `INSERT INTO agents (id, name, capabilities, version, token_hash, registered_at, last_seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          card.id,
-          card.name ?? null,
-          JSON.stringify(card.capabilities ?? []),
-          card.version ?? null,
-          hash,
-          ts,
-          ts,
-        );
-        logEvent(card.id, "agent.registered", card);
-        return Response.json({ token });
+        void recoverPending(card.id);
+        return Response.json({ ok: true });
       },
     },
 
@@ -251,64 +300,11 @@ const server = Bun.serve({
           event: AgentEvent;
         };
         if (!agentId || !event) return new Response("bad request", { status: 400 });
-        const authErr = await requireAgent(req, agentId);
-        if (authErr) return authErr;
-        db.query("UPDATE agents SET last_seen_at = ? WHERE id = ?").run(now(), agentId);
-        handleAgentEvent(agentId, event);
+        if (!(await storage.getAgent(agentId)))
+          return new Response("unknown agent", { status: 404 });
+        await storage.touchAgent(agentId, now());
+        await handleAgentEvent(agentId, event);
         return Response.json({ ok: true });
-      },
-    },
-
-    "/stream/:agentId": {
-      async GET(req) {
-        const agentId = req.params.agentId;
-        const authErr = await requireAgent(req, agentId);
-        if (authErr) return authErr;
-
-        const stream = new ReadableStream({
-          start(ctrl) {
-            const encoder = new TextEncoder();
-            let closed = false;
-            const subscriber = {
-              send: (event: HubEvent) => {
-                if (closed) return;
-                ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-              },
-              close: () => {
-                if (closed) return;
-                closed = true;
-                clearInterval(heartbeat);
-                try { ctrl.close(); } catch { /* ignore */ }
-              },
-            };
-
-            const unsub = bus.subscribe(agentId, subscriber);
-            ctrl.enqueue(encoder.encode(`: connected\n\n`));
-            const heartbeat = setInterval(() => {
-              if (closed) return;
-              try { ctrl.enqueue(encoder.encode(`: ping\n\n`)); } catch { /* ignore */ }
-            }, 15000);
-
-            logEvent(agentId, "agent.online", {});
-            recoverWorkingTasks(agentId);
-            flushPending(agentId);
-
-            const onAbort = () => {
-              subscriber.close();
-              unsub();
-              logEvent(agentId, "agent.offline", {});
-            };
-            req.signal.addEventListener("abort", onAbort);
-          },
-        });
-
-        return new Response(stream, {
-          headers: {
-            "content-type": "text/event-stream",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-          },
-        });
       },
     },
 
@@ -322,89 +318,60 @@ const server = Bun.serve({
           message: Message;
         };
         if (!body?.agentId || !body?.message) return new Response("bad request", { status: 400 });
-        const task = createTask(body);
+        const task = await createTask(body);
         if (!task) return new Response("unknown agent", { status: 404 });
         return Response.json(task);
       },
-      GET() {
-        const rows = db.query("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 200").all() as any[];
-        return Response.json(rows.map(rowToTask));
+      async GET() {
+        return Response.json((await storage.listTasks()).map(rowToTask));
       },
     },
 
     "/api/tasks/:id": {
-      GET(req) {
+      async GET(req) {
         const id = req.params.id;
-        const row = db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any;
+        const row = await storage.getTask(id);
         if (!row) return new Response("unknown task", { status: 404 });
         const task = rowToTask(row);
 
-        const stepRows = db
-          .query(
-            `SELECT created_at, payload FROM events
-             WHERE kind = 'task.step'
-               AND json_extract(payload, '$.taskId') = ?
-             ORDER BY COALESCE(json_extract(payload, '$.step.at'), created_at) DESC,
-                      id DESC
-             LIMIT 20`,
-          )
-          .all(id) as { created_at: string; payload: string }[];
-
-        const recentSteps = stepRows.map((r) => {
-          const parsed = JSON.parse(r.payload) as { step?: Record<string, unknown> };
-          return { ...(parsed.step ?? {}), at: (parsed.step as any)?.at ?? r.created_at };
+        const { count: stepCount, recent } = await storage.taskSteps(id, 20);
+        const recentSteps = recent.map((r) => {
+          const step = ((r.payload as any).step ?? {}) as Record<string, unknown>;
+          return { ...step, at: (step.at as string | undefined) ?? r.at };
         });
-
-        const { n: stepCount } = db
-          .query(
-            `SELECT COUNT(*) as n FROM events
-             WHERE kind = 'task.step'
-               AND json_extract(payload, '$.taskId') = ?`,
-          )
-          .get(id) as { n: number };
-
-        const counts = new Map<string, number>();
-        for (const s of recentSteps.slice(0, 10)) {
-          const kind = (s as any).kind as string | undefined;
-          const h = (s as any).argsHash as string | undefined;
-          if (kind !== "PreToolUse" || !h) continue;
-          counts.set(h, (counts.get(h) ?? 0) + 1);
-        }
-        const loopScore = counts.size === 0 ? 0 : Math.max(...counts.values());
 
         return Response.json({
           ...task,
           lastStepAt: recentSteps[0]?.at ?? null,
           stepCount,
-          loopScore,
-          connected: bus.isConnected(task.agentId),
+          connected: (await storage.getAgent(task.agentId)) !== undefined,
           recentSteps,
         });
       },
     },
 
     "/api/tasks/:id/cancel": {
-      POST(req) {
+      async POST(req) {
         const adminErr = requireAdmin(req);
         if (adminErr) return adminErr;
-        const task = cancelTask(req.params.id);
+        const task = await cancelTask(req.params.id);
         if (!task) return new Response("unknown task", { status: 404 });
         return Response.json(task);
       },
     },
 
     "/api/agents": {
-      GET() {
-        const rows = db.query("SELECT * FROM agents ORDER BY id").all() as any[];
+      async GET() {
         return Response.json(
-          rows.map((r) => ({
+          (await storage.listAgents()).map((r) => ({
             id: r.id,
             name: r.name,
-            capabilities: JSON.parse(r.capabilities),
+            capabilities: r.capabilities,
             version: r.version,
-            registeredAt: r.registered_at,
-            lastSeenAt: r.last_seen_at,
-            connected: bus.isConnected(r.id),
+            endpoint: r.endpoint,
+            registeredAt: r.registeredAt,
+            lastSeenAt: r.lastSeenAt,
+            connected: true,
           })),
         );
       },
@@ -413,37 +380,93 @@ const server = Bun.serve({
     "/api/agents/:id": {
       async DELETE(req) {
         const agentId = req.params.id;
-        const adminOk = ADMIN_TOKEN && bearer(req) === ADMIN_TOKEN;
-        if (!adminOk) {
-          const authErr = await requireAgent(req, agentId);
-          if (authErr) return authErr;
-        } else {
-          const exists = db.query("SELECT 1 FROM agents WHERE id = ?").get(agentId);
-          if (!exists) return new Response("unknown agent", { status: 404 });
-        }
-        const inflight = db
-          .query("SELECT id FROM tasks WHERE agent_id = ? AND state IN ('submitted','working')")
-          .all(agentId) as { id: string }[];
-        for (const row of inflight) cancelTask(row.id);
-        bus.kick(agentId, { type: "agent.removed", reason: "deregistered" });
-        db.query("DELETE FROM agents WHERE id = ?").run(agentId);
-        logEvent(agentId, "agent.deregistered", { canceledTaskCount: inflight.length });
+        const adminErr = requireAdmin(req);
+        if (adminErr) return adminErr;
+        const agent = await storage.getAgent(agentId);
+        if (!agent) return new Response("unknown agent", { status: 404 });
+        const inflight = await storage.inflightTasksForAgent(agentId);
+        for (const id of inflight) await cancelTask(id);
+        await postToAgent(agent, "/removed", { reason: "deregistered" });
+        await storage.deleteAgent(agentId);
+        await logEvent(agentId, "agent.deregistered", { canceledTaskCount: inflight.length });
         return Response.json({ ok: true, canceledTaskCount: inflight.length });
       },
     },
 
     "/api/events": {
-      GET() {
-        const rows = db.query("SELECT * FROM events ORDER BY id DESC LIMIT 200").all() as any[];
-        return Response.json(
-          rows.map((r) => ({
-            id: r.id,
-            agentId: r.agent_id,
-            kind: r.kind,
-            payload: JSON.parse(r.payload),
-            createdAt: r.created_at,
-          })),
-        );
+      async GET() {
+        return Response.json(await storage.recentEvents());
+      },
+    },
+
+    "/a2a/:agentId/.well-known/agent-card.json": {
+      async GET(req) {
+        const agentId = req.params.agentId;
+        const agent = await storage.getAgent(agentId);
+        if (!agent) return new Response("unknown agent", { status: 404 });
+        const hubUrl = server.url.toString().replace(/\/$/, "");
+        return Response.json(buildA2AAgentCard(agent, hubUrl));
+      },
+    },
+
+    "/a2a/:agentId/": {
+      async POST(req) {
+        const agentId = req.params.agentId;
+        const target = await storage.getAgent(agentId);
+
+        let body: { jsonrpc?: string; method?: string; params?: any; id?: unknown };
+        try {
+          body = (await req.json()) as typeof body;
+        } catch {
+          return jsonRpcError(null, -32700, "Parse error");
+        }
+        if (body.jsonrpc !== "2.0") {
+          return jsonRpcError(body.id, -32600, "Invalid Request");
+        }
+        if (!target) {
+          return jsonRpcError(body.id, -32601, `unknown agent: ${agentId}`);
+        }
+        const fromAgent = req.headers.get("x-a2a-from") ?? undefined;
+
+        if (body.method === "message/send") {
+          const message = body.params?.message as A2AMessage | undefined;
+          if (!message) return jsonRpcError(body.id, -32602, "params.message required");
+
+          const row = await createPeerTask(agentId, fromAgent, message);
+          if (!row) return jsonRpcError(body.id, -32603, "task create failed");
+
+          const completion = waitForCompletion(row.id, PEER_CALL_TIMEOUT_MS);
+          await dispatchTask(rowToTask(row));
+          try {
+            const finalRow = await completion;
+            return jsonRpcResult(body.id, taskRowToA2ATask(finalRow));
+          } catch (err) {
+            return jsonRpcError(
+              body.id,
+              -32000,
+              err instanceof Error ? err.message : String(err),
+            );
+          }
+        }
+
+        if (body.method === "tasks/get") {
+          const taskId = body.params?.id as string | undefined;
+          if (!taskId) return jsonRpcError(body.id, -32602, "params.id required");
+          const row = await storage.getTask(taskId);
+          if (!row) return jsonRpcError(body.id, -32601, "unknown task");
+          return jsonRpcResult(body.id, taskRowToA2ATask(row));
+        }
+
+        if (body.method === "tasks/cancel") {
+          const taskId = body.params?.id as string | undefined;
+          if (!taskId) return jsonRpcError(body.id, -32602, "params.id required");
+          const task = await cancelTask(taskId);
+          if (!task) return jsonRpcError(body.id, -32601, "unknown task");
+          const row = await storage.getTask(taskId);
+          return jsonRpcResult(body.id, row ? taskRowToA2ATask(row) : null);
+        }
+
+        return jsonRpcError(body.id, -32601, `Method ${body.method} not implemented`);
       },
     },
   },
@@ -457,9 +480,10 @@ if (supervisor.size() > 0) {
 }
 
 const shutdown = async (sig: string) => {
-  console.log(`\n[hub] ${sig}, shutting down supervisor`);
+  console.log(`\n[hub] ${sig}, shutting down`);
   await supervisor.stop();
   server.stop(true);
+  await storage.close();
   process.exit(0);
 };
 process.on("SIGINT", () => { void shutdown("SIGINT"); });

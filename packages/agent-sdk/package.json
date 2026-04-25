@@ -13,7 +13,9 @@
     "./bibe": "./src/bibe.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.112"
+    "@a2a-js/sdk": "^0.3.13",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.112",
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest"

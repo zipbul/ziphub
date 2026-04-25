@@ -4,8 +4,11 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetTestDb, TEST_DATABASE_URL } from "./helpers.ts";
 
 const HUB = "http://127.0.0.1:3004";
+
+await resetTestDb();
 
 let pass = 0;
 let fail = 0;
@@ -28,7 +31,7 @@ const hub = Bun.spawn(["bun", "packages/server/src/index.ts"], {
   env: {
     ...process.env,
     PORT: "3004",
-    ZIPHUB_DB: join(workDir, "smoke.db"),
+    ZIPHUB_DATABASE_URL: TEST_DATABASE_URL,
     ZIPHUB_AGENTS_CONFIG: cfgPath,
     ZIPHUB_SUPERVISOR_MISSING_CWD_INTERVAL_MS: "800",
   },

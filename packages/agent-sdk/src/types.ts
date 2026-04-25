@@ -33,28 +33,8 @@ export interface AgentCard {
   name?: string;
   capabilities: string[];
   version?: string;
+  endpoint: string;
 }
-
-export interface RegisterResponse {
-  token: string;
-}
-
-export type HubEvent =
-  | { type: "task.assigned"; task: Task }
-  | { type: "task.canceled"; taskId: string }
-  | { type: "agent.removed"; reason: "deregistered" }
-  | {
-      type: "peer.message";
-      from: string;
-      messageId: string;
-      parts: Part[];
-    }
-  | {
-      type: "peer.undeliverable";
-      to: string;
-      messageId: string;
-      reason: "offline" | "unknown";
-    };
 
 export const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -81,5 +61,4 @@ export type AgentEvent =
       level: "info" | "warn" | "error";
       message: string;
       data?: unknown;
-    }
-  | { type: "peer.send"; to: string; messageId?: string; parts: Part[] };
+    };

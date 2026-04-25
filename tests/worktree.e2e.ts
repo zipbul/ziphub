@@ -5,8 +5,11 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetTestDb, TEST_DATABASE_URL } from "./helpers.ts";
 
 const HUB = "http://127.0.0.1:3003";
+
+await resetTestDb();
 
 let pass = 0;
 let fail = 0;
@@ -63,7 +66,7 @@ const hub = Bun.spawn(["bun", "packages/server/src/index.ts"], {
   env: {
     ...process.env,
     PORT: "3003",
-    ZIPHUB_DB: join(workDir, "smoke.db"),
+    ZIPHUB_DATABASE_URL: TEST_DATABASE_URL,
     ZIPHUB_AGENTS_CONFIG: cfgPath,
   },
   cwd: process.cwd(),
@@ -141,7 +144,7 @@ try {
     waitFor(async () => await getTask(tb.id), (t) => ["completed", "failed", "canceled"].includes(t.state), 240_000, "task B terminal"),
   ]);
   const elapsed = ((Date.now() - tStart) / 1000).toFixed(1);
-  console.log(`  both terminal in ${elapsed}s — A=${doneA.state} (steps=${doneA.stepCount}, loop=${doneA.loopScore}), B=${doneB.state} (steps=${doneB.stepCount}, loop=${doneB.loopScore})`);
+  console.log(`  both terminal in ${elapsed}s — A=${doneA.state} (steps=${doneA.stepCount}), B=${doneB.state} (steps=${doneB.stepCount})`);
 
   check("task A completed", doneA.state === "completed", doneA.state);
   check("task B completed", doneB.state === "completed", doneB.state);
